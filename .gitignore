@@ -1,0 +1,24 @@
+# Environnement & Secrets
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Airflow (fichiers générés en local)
+airflow_home/airflow.db
+airflow_home/airflow.cfg
+airflow_home/logs/
+airflow_home/simple_auth_manager_passwords.json.generated
+
+# Logs & Données volumineuses / Images téléchargées / Documentations
+logs/
+data/images/
+data/output/
+data/final/
+data/fakenewsnet/
+Documentation/
+
+*.parquet
+*.jpg
+*.jpeg
+*.png

@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/home/jo/Documents/uv/Projet_12/.venv/bin/python",
+    "terminal.integrated.env.linux": {
+        "AIRFLOW_HOME": "/home/jo/Documents/uv/Projet_12/airflow_home",
+        "AIRFLOW__CORE__LOAD_EXAMPLES": "False"
+    }
+}
