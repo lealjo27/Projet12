@@ -37,16 +37,49 @@ def lister_dates_extractions() -> list[str]:
     return sorted(dates, reverse=True)
 
 
+def _extraire_duree_log(log_file: str) -> float | None:
+    """Calcule la durée en secondes entre le 1er et le dernier horodatage d'un log Airflow."""
+    motif_ts = re.compile(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+    premier_ts = None
+    dernier_ts = None
+
+    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+        for ligne in f:
+            m = motif_ts.search(ligne)
+            if m:
+                try:
+                    ts = datetime.fromisoformat(m.group(1).replace(" ", "T"))
+                    if premier_ts is None:
+                        premier_ts = ts
+                    dernier_ts = ts
+                except ValueError:
+                    pass
+
+    if premier_ts and dernier_ts:
+        return round(max(0.01, (dernier_ts - premier_ts).total_seconds()), 2)
+    return None
+
+
 def analyser_logs_airflow(mode_selection: str) -> dict:
     """
     Analyse tous les journaux d'exécution Airflow dans airflow_home/logs/dag_id=checkit_multimodal_etl/.
-    Compatible avec Airflow 2 et Airflow 3 (logs texte et structlog JSON).
+    Calcule les statuts, erreurs, retries et durées réelles d'exécution par tâche.
     """
     est_cumule = mode_selection == "Toutes les extractions (Cumulé)"
     dossier_logs_dag = "./airflow_home/logs/dag_id=checkit_multimodal_etl"
 
+    ordre_taches = [
+        "extract_newsdata",
+        "extract_factcheck",
+        "extract_fakenewsnet",
+        "extract_franceinfo",
+        "transform_and_merge",
+        "load_to_postgres",
+    ]
+
     runs_recap = []
     erreurs_airflow = []
+    durees_par_tache = []
     nb_taches_loggees = 0
     nb_retries = 0
 
@@ -61,13 +94,12 @@ def analyser_logs_airflow(mode_selection: str) -> dict:
             match_date = re.search(r"(\d{4}-\d{2}-\d{2})", run_id)
             date_run = match_date.group(1) if match_date else "Inconnue"
 
-            # Si une date précise est sélectionnée, on garde les runs de cette date
-            # tout en conservant l'historique global dans runs_recap pour diagnostic
             fichiers_log = sorted(glob.glob(os.path.join(run_dir, "**", "*.log"), recursive=True))
             nb_taches_loggees += len(fichiers_log)
 
             taches_echec = []
             taches_ok = []
+            durees_run_courant = {}
 
             for log_file in fichiers_log:
                 match_task = re.search(r"task_id=([^/\\]+)", log_file)
@@ -77,11 +109,20 @@ def analyser_logs_airflow(mode_selection: str) -> dict:
                 if attempt_num > 1:
                     nb_retries += 1
 
-                a_echoue = False
-                dernier_msg_erreur = ""
+                duree_sec = _extraire_duree_log(log_file)
+                if duree_sec is not None:
+                    durees_run_courant[task_name] = duree_sec
+                    if est_cumule or date_run == mode_selection:
+                        durees_par_tache.append({
+                            "Tâche": task_name,
+                            "Run ID": run_id[:28],
+                            "Date": date_run,
+                            "Durée (s)": duree_sec,
+                        })
 
+                a_echoue = False
                 with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                    for num_ligne, ligne in enumerate(f, start=1):
+                    for ligne in f:
                         l_strip = ligne.strip()
                         l_low = l_strip.lower()
 
@@ -98,14 +139,13 @@ def analyser_logs_airflow(mode_selection: str) -> dict:
                             or "traceback (most recent call last)" in l_low
                         ):
                             a_echoue = True
-                            dernier_msg_erreur = l_strip[:220]
                             if est_cumule or date_run == mode_selection:
                                 erreurs_airflow.append({
                                     "Date Run": date_run,
                                     "Run ID": run_id[:32],
                                     "Tâche": task_name,
                                     "Tentative": attempt_num,
-                                    "Détail erreur": dernier_msg_erreur,
+                                    "Détail erreur": l_strip[:220],
                                 })
 
                 if a_echoue:
@@ -113,16 +153,50 @@ def analyser_logs_airflow(mode_selection: str) -> dict:
                 else:
                     taches_ok.append(task_name)
 
+            # Calcul de la durée murale estimée du run : max(extract_*) + transform + load
+            durees_extract = [
+                v for k, v in durees_run_courant.items() if k.startswith("extract_")
+            ]
+            duree_totale_run = round(
+                (max(durees_extract) if durees_extract else 0.0)
+                + durees_run_courant.get("transform_and_merge", 0.0)
+                + durees_run_courant.get("load_to_postgres", 0.0),
+                2,
+            )
+
             statut_run = "❌ FAILED" if taches_echec else "✅ SUCCESS"
             runs_recap.append({
                 "Date": date_run,
                 "Run ID": run_id[:34],
                 "Statut": statut_run,
+                "Durée pipeline (s)": duree_totale_run,
                 "Tâches OK": len(set(taches_ok)),
                 "Tâches en échec": ", ".join(sorted(set(taches_echec))) if taches_echec else "Aucune",
             })
 
     df_runs = pd.DataFrame(runs_recap)
+    df_durees_brut = pd.DataFrame(durees_par_tache)
+
+    # Agrégation des durées par tâche (moyenne, min, max, dernier run)
+    if not df_durees_brut.empty:
+        df_synthese_taches = (
+            df_durees_brut.groupby("Tâche", as_index=False)
+            .agg(
+                **{
+                    "Durée moyenne (s)": ("Durée (s)", lambda s: round(s.mean(), 2)),
+                    "Durée max (s)": ("Durée (s)", lambda s: round(s.max(), 2)),
+                    "Dernière durée (s)": ("Durée (s)", "first"),
+                    "Nb exécutions": ("Durée (s)", "count"),
+                }
+            )
+        )
+        df_synthese_taches["Ordre"] = df_synthese_taches["Tâche"].apply(
+            lambda t: ordre_taches.index(t) if t in ordre_taches else 99
+        )
+        df_synthese_taches = df_synthese_taches.sort_values("Ordre").drop(columns=["Ordre"])
+    else:
+        df_synthese_taches = pd.DataFrame()
+
     nb_runs_periode = (
         len(df_runs)
         if est_cumule or df_runs.empty
@@ -136,6 +210,7 @@ def analyser_logs_airflow(mode_selection: str) -> dict:
 
     return {
         "df_runs": df_runs,
+        "df_synthese_taches": df_synthese_taches,
         "nb_runs_airflow": nb_runs_periode,
         "nb_runs_echec": nb_runs_echec,
         "nb_taches_loggees": nb_taches_loggees,
@@ -347,7 +422,12 @@ else:
         delta_color="off",
     )
 
-
+k5.metric(
+    "🚨 Runs DAG en Échec",
+    f"{airflow_info['nb_runs_echec']} / {len(airflow_info['df_runs'])}",
+    f"Erreurs logs : {nb_err_airflow} Airflow | {data['nb_error']} ETL",
+    delta_color="inverse" if airflow_info["nb_runs_echec"] > 0 else "normal",
+)
 
 st.divider()
 
@@ -428,20 +508,13 @@ with tab2:
 with tab3:
     r1, r2 = st.columns(2)
     with r1:
-        st.subheader("Temps d'exécution par tâche Airflow (s)")
-        taches_df = pd.DataFrame({
-            "Tâche": [
-                "1. extract_newsdata",
-                "2. extract_factcheck",
-                "3. extract_fakenewsnet",
-                "4. extract_franceinfo",
-                "5. transform_and_merge",
-                "6. load_to_postgres",
-            ],
-            "Durée (s)": [12, 18, 45, 9, 4, 2],
-        }).set_index("Tâche")
-        st.bar_chart(taches_df, color="#1ABC9C")
-        st.caption("Extraction parallèle : durée totale = max(extract_*) ≈ 45 s.")
+        st.subheader("⏱️ Durée réelle d'exécution par tâche Airflow (s)")
+        df_taches = airflow_info["df_synthese_taches"]
+        if not df_taches.empty:
+            st.bar_chart(df_taches.set_index("Tâche")[["Durée moyenne (s)"]], color="#1ABC9C")
+            st.dataframe(df_taches, width="stretch", hide_index=True)
+        else:
+            st.info("Aucune durée de tâche mesurable trouvée dans les logs Airflow.")
 
     with r2:
         st.subheader("Journalisation ETL & Airflow")
